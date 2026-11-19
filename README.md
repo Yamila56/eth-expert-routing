@@ -35,22 +35,29 @@ flowchart LR
 
 这轮实验使用同一时间切分和单个随机种子，结果来自验证集。留出的测试集尚未评估。
 
-## 代码结构与运行
+## 强化学习 Agent 怎样训练
 
-项目按决策流程组织。[`market`](eth_router/market.py) 准备分钟行情，[`evidence`](eth_router/evidence.py) 维护专家账本并拟合适用度，[`policy`](eth_router/policy.py) 实现专家评分和换仓门槛，[`train`](eth_router/train.py) 提供独立的 Double DQN 训练入口，[`replay`](eth_router/replay.py) 和 [`viewer`](eth_router/viewer.py) 生成逐分钟决策记录及交互页面。
+专家负责给出动作价值，高层 Agent 负责选择实际仓位并接收扣费后的奖励。每分钟的交易转移进入经验回放。在线网络从这些转移中学习未来净损益，目标网络提供相对稳定的下一步估值。训练还会检索相似状态下采取同一动作的近期经验，并利用仅由训练价格生成的动态规划示范约束动作分布。三个目标共同更新专家权重和换仓门槛。
 
-准备 Python 3.11+、单独取得的专家源仓库以及 `df_train.feather`、`df_val.feather`。下面的 `LOCAL_EXPERT_CHECKOUT` 是本地依赖路径。可将训练命令的 `--score-device cpu` 改成 `cuda:0`，用 GPU 批量生成专家评分。
+- [专家模型与冻结权重加载](eth_router/experts.py) 定义底层网络。本项目直接读取权重和特征名。
+- [市场环境](eth_router/market_env.py) 实现仓位转移、模拟成交、费用及训练专用的动态规划示范。
+- [Agent 更新](eth_router/agent.py) 实现探索、Double DQN、目标网络软更新及三项损失。[经验存储](eth_router/memory.py) 分别负责随机回放与相似状态价值检索。
+- [完整架构说明](docs/architecture.md) 展开逐分钟闭环、模型输入和每项训练信号。
+
+## 运行
+
+准备 Python 3.11+、作者提供的专家权重和特征列表，以及原始 `df_train.feather` 和 `df_val.feather`。将 `single_features.npy`、`trend_features.npy` 与六个权重文件放入 `data/experts`。六个权重对应作者的 slope 1–3 和 vol 1–3，依次命名为 `slope_1.pkl` 至 `slope_3.pkl`、`vol_1.pkl` 至 `vol_3.pkl`。也可用 `--upstream LOCAL_EXPERT_CHECKOUT` 读取这些文件的原始路径。
 
 ```bash
 python -m pip install -r requirements.txt
 python -m eth_router.market --source data/raw --output data/market
-python -m eth_router.evidence --upstream LOCAL_EXPERT_CHECKOUT --source data/market --output data/evidence
-python -m eth_router.train --upstream LOCAL_EXPERT_CHECKOUT --data data/evidence --output runs/router --score-device cpu
+python -m eth_router.evidence --expert-assets data/experts --source data/market --output data/evidence
+python -m eth_router.train --expert-assets data/experts --data data/evidence --output runs/router
 python -m eth_router.viewer --trace runs/router/expert_trace.npz --output runs/router/replay.html
 ```
 
-上面的实验结论来自项目完成时的正式训练对照，使用了示范与记忆辅助损失。发布版采用独立的 Double DQN 训练入口，保留同一个决策网络和回放口径。该入口已做短程验证。使用原实验的高层检查点回放时，发布版在完整验证区间复现了原来的仓位路径和净损益。
+训练输出包含各损失、情景记忆命中数、检查点与决策轨迹。已有高层检查点可以交给 [回放入口](eth_router/replay.py)。发布版的训练链路通过了短程检查。加载已完成正式实验的高层检查点时，发布版完整重放了验证期的 172,439 个动作，净损益一致。README 中的实验结论来自原正式对照。
 
 ## 研究来源
 
-此仓库提供路由、专家证据构建、训练和回放实现。实验使用 MacroHFT 的历史市场数据和六个冻结专家，适用度设计参考 FineFT。上游代码、市场数据与权重请从作者提供的来源单独取得。专家适配器按 MacroHFT 提交 `31e5ef41f93b2aea6e63e6ae2267675c997a8e54` 的接口验证。[MacroHFT · KDD 2024](https://github.com/ZONG0004/MacroHFT/tree/31e5ef41f93b2aea6e63e6ae2267675c997a8e54) · [FineFT · KDD 2026](https://github.com/qinmoelei/FineFT_code_space)
+实验使用 MacroHFT 的历史数据与六个冻结专家权重。情景记忆及示范辅助优化来自该论文方法，适用度设计参考 FineFT。仓库内包含可读的专家网络与 Agent 训练实现。历史数据、特征列表和底层权重可从作者来源单独取得，其序列化格式按 MacroHFT 提交 `31e5ef41f93b2aea6e63e6ae2267675c997a8e54` 验证。[MacroHFT · KDD 2024](https://github.com/ZONG0004/MacroHFT/tree/31e5ef41f93b2aea6e63e6ae2267675c997a8e54) · [FineFT · KDD 2026](https://github.com/qinmoelei/FineFT_code_space)

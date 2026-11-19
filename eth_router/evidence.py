@@ -160,7 +160,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--upstream", type=Path, required=True)
+    ExpertSource.add_arguments(parser)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--epochs", type=int, default=16)
     parser.add_argument("--fold-minutes", type=int, default=MINUTES_PER_FOLD)
@@ -174,7 +174,7 @@ def main():
     source, output = args.source.resolve(), args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
     torch.manual_seed(args.seed)
-    experts = ExpertSource(args.upstream, args.device)
+    experts = ExpertSource.from_args(args, args.device)
     commission = 0.0002
     timings = {}
     datasets = {}

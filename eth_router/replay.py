@@ -8,10 +8,8 @@ import pandas as pd
 import torch
 
 from .checkpoint_source import ExpertSource
+from .market_env import settle
 from .policy import CONTEXT, ExpertRouter
-
-POSITION_ETH = 0.2
-FEE_RATE = 0.0002
 
 
 def observations(frame, experts):
@@ -46,21 +44,22 @@ def simulate(router, inputs, scores, frame, device):
         prior = actions[minute] = row[prior]
     details = evaluations[np.arange(count), previous]
     close = frame["close"].to_numpy(dtype=np.float64)
-    fees = np.abs(actions - previous) * POSITION_ETH * close[:-1] * FEE_RATE
-    rewards = actions * POSITION_ETH * np.diff(close) - fees
+    rewards, fees, cash_flow = settle(close[:-1], close[1:], previous, actions)
     return {
         "timestamp": pd.to_datetime(frame["timestamp"].iloc[:-1]).to_numpy(dtype="datetime64[ns]"),
         "previous_action": previous, "action": actions,
         "action_q": details[:, :2], "mixed_q": details[:, 2:4], "threshold": details[:, 4],
         "weights": details[:, 5:11], "votes": details[:, 11:17],
         "evidence": inputs[2][:-1, 2:], "evidence_columns": CONTEXT,
-        "fee": fees, "reward": rewards,
+        "fee": fees, "reward": rewards, "cash_flow": cash_flow,
     }
 
 
 def summarize(trace):
     pnl = np.r_[0, np.cumsum(trace["reward"])]
+    required = max(0.0, -np.cumsum(trace["cash_flow"]).min())
     return {
+        "validation_return": float(pnl[-1] / required) if required else 0.0,
         "net_pnl_usdt": float(pnl[-1]),
         "max_drawdown_usdt": float((np.maximum.accumulate(pnl) - pnl).max()),
         "switches": int(np.count_nonzero(trace["action"] != trace["previous_action"])),
@@ -70,14 +69,14 @@ def summarize(trace):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--upstream", type=Path, required=True)
+    ExpertSource.add_arguments(parser)
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--device", default="cpu")
     args = parser.parse_args()
     device = torch.device(args.device)
-    experts = ExpertSource(args.upstream, device)
+    experts = ExpertSource.from_args(args, device)
     frame = pd.read_feather(args.input)
     inputs = observations(frame, experts)
     state = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
