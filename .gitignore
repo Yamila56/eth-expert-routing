@@ -1,0 +1,17 @@
+/vendor/
+/data/
+/runs/
+/.venv/
+/__pycache__/
+**/__pycache__/
+*.log
+*.pt
+*.pkl
+*.feather
+*.npz
+/prepare_data.py
+/prepare_expert_data.py
+/render_expert_replay.py
+/run_pair.ps1
+/download_data.py
+/PROJECT.md
