@@ -1,41 +1,44 @@
 # ETH Expert Routing
 
-ETH Expert Routing is a reinforcement learning project for minute-level ETH/USDT position management. It studies how a policy can combine specialist trading signals as market conditions change and decide whether a proposed position change justifies another trade.
+ETH Expert Routing is a PyTorch agent that manages a simulated ETH/USDT position one minute at a time. Six frozen trend and volatility specialists each score two positions: flat and long 0.2 ETH. The agent learns how much weight to give each specialist and how large an advantage it needs to switch positions. Every decision can be inspected in a browser replay.
 
-The system separates expert weighting from position control. An expert's current recommendation, recent performance after fees, and fit to the present market all inform its weight. A learned switching threshold then determines how much support a change in position needs. The repository includes the training pipeline and an interactive replay that records the evidence behind each decision.
+## Features
+
+- **Independent expert accounts** — Follow the trades each specialist would have made on its own. Its six-hour performance record includes fees and tracks how often it changed position, even when the agent followed another specialist.
+- **Walk-forward market fit** — Compare the current hour with historical conditions in which each specialist outperformed the group median. Fit scores for training are generated from previously settled windows. Validation uses models fitted on the training split.
+- **Position-aware routing** — Ask every specialist to score both actions from the agent's actual position. A shared network can give different weights to two experts recommending the same trade based on the strength of their preferences, their track records and their fit to current conditions.
+- **Minute-level decision replay** — Select a timestamp to inspect the votes and weights, compare action values before and after the switching threshold, and see the position and fee recorded by the simulator.
 
 ## Architecture
 
 ```mermaid
-flowchart TD
-    M[Minute-level market data] --> X[Six frozen experts]
+flowchart LR
+    M[Minute observations] --> X[Six frozen experts]
+    X --> L[Six independent accounts]
     M --> F[Market fit]
-    X --> B[Individual expert accounts]
-    X --> R[Shared scoring network]
-    B --> R
+    L --> R[Shared expert scorer]
     F --> R
+    X --> R
     R --> Q[Weighted action values]
     Q --> G[Switching threshold]
+    P[Previous agent position] --> G
     G --> A[Target position]
+    A --> S[Settlement at the next close]
 ```
-
-### Expert evidence
-
-Recent performance and market fit describe different aspects of an expert's behavior. Each expert trades in its own simulated account, which provides a rolling record of settled net profit and loss and position changes. Market fit describes how closely current conditions resemble historical windows in which that expert performed well relative to its peers.
-
-FineFT models the market conditions in which an expert tends to perform well and uses this information to guide routing. ETH Expert Routing adapts that idea by supplying a market-fit score to the learned weighting network alongside recent performance. The default score uses distance from an expert's historical feature center. A variational autoencoder provides an optional reconstruction-based score. [FineFT, KDD 2026](https://doi.org/10.1145/3770854.3780187)
 
 ### Expert routing
 
-MacroHFT provides the hierarchical starting point and six pretrained specialists covering trend and volatility conditions. Each specialist estimates the value of holding ETH and staying flat. A shared network scores each expert using its identity, action preferences, and evidence in the current market. The resulting weights sum to one and are applied to both action values, so the policy can draw on several experts at once. [MacroHFT, KDD 2024](https://doi.org/10.1145/3637528.3672064)
+The router uses two views of each specialist. Its track record follows its own sequence of positions. Its current recommendation answers a different question: given the position the agent actually holds, how does this expert value staying flat or holding ETH? Keeping these paths separate means the router can evaluate a specialist that has held ETH for an hour even if the agent is still flat.
+
+The shared scorer reads each expert's identity, preferred direction and action-value margin alongside settled performance and market fit. Fit is calibrated using one-hour return, volatility, spread, volume and volume imbalance. The default estimator measures standardized distance from the center of favorable windows. An optional estimator uses variational autoencoder reconstruction error. A softmax turns the six expert scores into weights, and the same weights aggregate the flat and long action values.
 
 ### Position control
 
-The router may favor a different position by a small margin. Before selecting an action, the policy lowers the value of switching by a learned, nonnegative threshold. The threshold depends on the market state, the current position, expert disagreement, and the fit of the experts receiving weight. The simulator charges a fee on each executed position change.
+A second network sets a switching threshold from the market state, previous position, expert disagreement and weighted market fit. For example, when the agent is flat, the threshold is subtracted from the aggregated long value before the policy selects the higher-valued action. The threshold is expressed in action-value units. The simulator separately charges 0.02% of traded value when a position changes at the current close and marks the position at the next close.
 
 ### Policy training
 
-The high-level policy learns from the net reward of each simulated transition while the experts remain frozen. Double DQN supplies the temporal-difference target. Two auxiliary objectives adapted from MacroHFT provide additional training signals. Episodic memory retrieves value estimates from nearby observations with the same action, and dynamic programming over the training price series supplies demonstration targets for the action distribution. The shared router and switching threshold are optimized together. [MacroHFT, KDD 2024](https://doi.org/10.1145/3637528.3672064)
+Training updates the shared scorer and threshold together while keeping the specialists frozen. Double DQN learns from the simulated account's net reward. Two auxiliary signals shape the same action values: episodic memory retrieves estimates for matching actions in nearby states, and a dynamic program over the training prices supplies hindsight action preferences. Replay needs only the learned policy, expert scores and observations available at each minute.
 
 ## Quick Start
 
@@ -76,3 +79,7 @@ python -m eth_router.viewer --trace runs/quickstart/model/expert_trace.npz --out
 Training saves the router checkpoint as `runs/quickstart/model/router.pt` and the validation trace alongside it. Open `runs/quickstart/replay.html` in a browser to inspect each minute's expert recommendations, routing weights, switching threshold, selected position, and transaction fee.
 
 For full-length data splits, omit `--limit 8192` from the market preparation command and `--fold-minutes 3600 --epochs 1` from the evidence command. Additional options cover CUDA expert inference, independently stored weights, and replay from an existing checkpoint. [Architecture and configuration](docs/architecture.md)
+
+## Acknowledgments
+
+MacroHFT provides the ETH/USDT data, feature lists and pretrained expert checkpoints. Its hierarchical value aggregation, episodic memory and demonstration objectives form the basis of the training design. FineFT motivates estimating expert suitability from favorable market windows. Here, suitability and independent account histories feed a shared expert scorer, followed by a learned switching threshold. [MacroHFT](https://github.com/ZONG0004/MacroHFT) · [FineFT](https://github.com/qinmoelei/FineFT_code_space)
