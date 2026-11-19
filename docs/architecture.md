@@ -13,9 +13,8 @@ flowchart LR
     R --> G[聚合价值与阈值调整]
     G --> A[目标仓位]
     A --> P[模拟成交与净奖励]
-    P --> X[转移回放和情景记忆]
-    X --> U[高层策略更新]
-    D[训练价格序列的动态规划示范] --> U
+    T[同一分钟的四种仓位转移] --> B[扣费奖励与后续仓位估值]
+    B --> U[动作价值和价值差损失]
     U --> R
 ```
 
@@ -24,7 +23,11 @@ flowchart LR
 3. **专家路由与仓位控制。** 共享 MLP 对每个专家输出标量，经 softmax 得到专家权重。聚合价值为专家动作价值的加权和。阈值网络以市场状态、上一仓位、专家分歧及加权适用度为条件，对换仓动作的价值施加非负扣减。输出动作由两个调整后价值的最大值确定，价值相等时选择空仓。[路由策略](../eth_router/policy.py)
 4. **模拟结算。** 在第 $t$ 分钟收盘价成交，按成交金额收取单边 0.02% 手续费。第 $t+1$ 分钟收盘价用于计算新仓位的标记损益，两者合成该步奖励。回放按两种上一仓位批量计算候选动作，再顺序恢复实际持仓路径。[交易环境](../eth_router/market_env.py) · [回放程序](../eth_router/replay.py)
 
-## 训练目标
+## 配对动作训练
+
+默认训练器在每个历史分钟枚举两种上一仓位和两种目标仓位，共用环境结算函数计算四种即时奖励。下一步按目标仓位索引后续价值，终止步的后续价值为零。每轮随机遍历训练分钟。两个等权 Huber 损失分别拟合动作价值与持仓相对空仓的价值差。
+
+## 轨迹训练（命令行选项 `--trainer trajectory`）
 
 训练使用 ε-greedy 探索。每个交易时点均产生一个转移，记录时间索引、上一仓位、动作、扣费奖励与终止标记。回放缓冲区保存这些转移，并支持随机批次采样。冻结的专家动作价值可批量预计算，高层策略随交互推进更新。[训练入口](../eth_router/train.py) · [经验存储](../eth_router/memory.py)
 
@@ -64,3 +67,7 @@ python -m eth_router.viewer --trace runs/quickstart/validation.npz --output runs
 ## 实验记录
 
 正式对照使用单个随机种子和固定验证区间。发布版保留三类训练目标、冻结专家与完整路由网络，训练入口已完成短程集成验证。用原正式实验检查点运行时，发布版复现了完整验证区间的动作序列和净损益。正式比较的数值仍以原实验记录为准。[MacroHFT 论文](https://doi.org/10.1145/3637528.3672064)
+
+## Sources
+
+[MacroHFT](https://github.com/ZONG0004/MacroHFT) supplies the market data, feature lists and pretrained specialists. The trajectory trainer adapts its hierarchical value aggregation, episodic memory and demonstration objectives. [FineFT](https://arxiv.org/abs/2512.23773) motivates estimating expert suitability from favorable market windows. Historical validation records above refer to the trajectory method.

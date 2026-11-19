@@ -38,7 +38,9 @@ A second network sets a switching threshold from the market state, previous posi
 
 ### Policy training
 
-Training updates the shared scorer and threshold together while keeping the specialists frozen. Double DQN learns from the simulated account's net reward. Two auxiliary signals shape the same action values: episodic memory retrieves estimates for matching actions in nearby states, and a dynamic program over the training prices supplies hindsight action preferences. Replay needs only the learned policy, expert scores and observations available at each minute.
+For each training minute, the simulator can settle both possible actions against the same next close. From a flat account these actions mean staying flat or buying. From a long account they mean selling or holding. The default trainer evaluates all four cases, charging each switch its own fee. This pairing relies on the simulator's fixed price path and assumes the agent's orders have no market impact.
+
+A Double DQN target adds the continuation value from the position each action would leave behind. Two Huber losses train the shared scorer and threshold together. One fits the action values, and the other fits the difference between them, giving the decision margin a direct training signal. The next price enters the target only after the simulated step. During replay the agent sees the current observations and its actual position.
 
 ## Quick Start
 
@@ -80,6 +82,4 @@ Training saves the router checkpoint as `runs/quickstart/model/router.pt` and th
 
 For full-length data splits, omit `--limit 8192` from the market preparation command and `--fold-minutes 3600 --epochs 1` from the evidence command. Additional options cover CUDA expert inference, independently stored weights, and replay from an existing checkpoint. [Architecture and configuration](docs/architecture.md)
 
-## Acknowledgments
-
-MacroHFT provides the ETH/USDT data, feature lists and pretrained expert checkpoints. Its hierarchical value aggregation, episodic memory and demonstration objectives form the basis of the training design. FineFT motivates estimating expert suitability from favorable market windows. Here, suitability and independent account histories feed a shared expert scorer, followed by a learned switching threshold. [MacroHFT](https://github.com/ZONG0004/MacroHFT) · [FineFT](https://github.com/qinmoelei/FineFT_code_space)
+Data, checkpoint and method credits are listed in the [architecture notes](docs/architecture.md#sources).

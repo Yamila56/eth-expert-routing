@@ -1,4 +1,4 @@
-"""Train the router with an online account path and batched Double DQN updates."""
+"""Train the router with paired actions or sampled account trajectories."""
 import argparse
 from pathlib import Path
 
@@ -9,6 +9,7 @@ import torch
 from .agent import RoutingAgent
 from .checkpoint_source import ExpertSource
 from .market_env import TradingEpisode, hindsight_values
+from .paired import fit_paired
 from .policy import ExpertRouter
 from .replay import observations, simulate, summarize
 
@@ -52,6 +53,7 @@ def main():
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--seed", type=int, default=12345)
     parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--trainer", choices=("paired", "trajectory"), default="paired")
     args = parser.parse_args()
     if args.epochs < 1:
         parser.error("--epochs must be positive")
@@ -61,15 +63,18 @@ def main():
     device = torch.device(args.device)
     train = pd.read_feather(args.data / "train.feather")
     val = pd.read_feather(args.data / "val.feather")
-    if len(train) <= 1024 or len(val) < 2:
+    if args.trainer == "trajectory" and len(train) <= 1024:
         parser.error("Provide at least 1025 training observations and two validation observations")
+    if min(len(train), len(val)) < 2:
+        parser.error("Both splits need at least two observations")
     train_inputs, val_inputs = observations(train, experts), observations(val, experts)
     train_scores, val_scores = experts.scores(train), experts.scores(val)
     router = ExpertRouter(train_inputs[0].shape[1], train_inputs[1].shape[1], 0.05).to(device)
     args.output.mkdir(parents=True, exist_ok=True)
     best = -float("inf")
-    for epoch, learning in fit(router, train_inputs, train_scores, train["close"].to_numpy(),
-                              epochs=args.epochs, seed=args.seed, device=device):
+    trainer = fit_paired if args.trainer == "paired" else fit
+    for epoch, learning in trainer(router, train_inputs, train_scores, train["close"].to_numpy(),
+                                   epochs=args.epochs, seed=args.seed, device=device):
         trace = simulate(router, val_inputs, val_scores, val, device)
         metrics = summarize(trace)
         print({"epoch": epoch, **learning, **metrics}, flush=True)
