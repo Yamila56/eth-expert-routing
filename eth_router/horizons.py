@@ -9,7 +9,10 @@ import torch
 from torch import nn
 
 from .market_env import settle
-from .outcomes import HALF_LIVES, HISTORY_MINUTES, decision_evidence, load_market, position_path
+from .outcomes import (
+    ACCOUNT_FIELDS, HALF_LIVES, HISTORY_MINUTES, OUTCOME_FIELDS, OUTCOME_WINDOWS,
+    decision_evidence, load_market, net_reward_bps, position_path,
+)
 from .paired import fit_action_values
 
 
@@ -24,14 +27,19 @@ class HorizonExpert(nn.Module):
 
 
 class PositionPolicy(nn.Module):
-    def __init__(self, features):
+    def __init__(self, market_prior):
         super().__init__()
-        self.expert_encoder = nn.Sequential(nn.Linear(len(HALF_LIVES) + 2 + 5, 32), nn.SiLU(), nn.Linear(32, 32))
-        self.values = nn.Sequential(nn.Linear(features + 33, 48), nn.SiLU(), nn.Linear(48, 2))
+        self.market_prior = market_prior.requires_grad_(False)
+        width = 3 + ACCOUNT_FIELDS + OUTCOME_FIELDS * len(OUTCOME_WINDOWS)
+        self.expert_encoder = nn.Sequential(nn.Linear(width, 32), nn.SiLU(), nn.Linear(32, 32))
+        self.residual = nn.Sequential(nn.Linear(33, 48), nn.SiLU(), nn.Linear(48, 2))
+        nn.init.zeros_(self.residual[-1].weight)
+        nn.init.zeros_(self.residual[-1].bias)
 
     def forward(self, market, position, evidence):
         encoded = self.expert_encoder(evidence).mean(dim=-2)
-        return self.values(torch.cat((market, position, encoded), dim=-1))
+        change = self.residual(torch.cat((position, encoded), dim=-1))
+        return self.market_prior(market, position) + change
 
 
 class MarketSplit:
@@ -59,24 +67,27 @@ def expert_scores(experts, market, device):
 
 
 def policy_inputs(opinions, margins, evidence, device, *, include_outcomes):
-    shape = opinions.shape
-    identity = np.broadcast_to(np.eye(len(HALF_LIVES), dtype=np.float32), (*shape, len(HALF_LIVES)))
-    # Use fixed units for the ledger and sample coverage. Keep raw fields for the replay.
+    # One normalized log half-life per expert. The shared encoder is independent of set size.
+    log_horizons = np.log2(HALF_LIVES)
+    horizon = np.broadcast_to((log_horizons - log_horizons.mean()) / log_horizons.std(), opinions.shape)
     records = evidence.copy()
-    records[..., (0, 2)] /= 100
-    records[..., 4] /= HISTORY_MINUTES
+    records[..., 0] /= 100
+    records[..., ACCOUNT_FIELDS::OUTCOME_FIELDS] /= 100
+    records[..., ACCOUNT_FIELDS + 2::OUTCOME_FIELDS] /= HISTORY_MINUTES
     if not include_outcomes:
-        records[..., 2:] = 0
-    result = np.concatenate((identity, opinions[..., None], margins[..., None], records), axis=-1, dtype=np.float32)
+        records[..., ACCOUNT_FIELDS:] = 0
+    result = np.concatenate((horizon[..., None], opinions[..., None], margins[..., None], records),
+                            axis=-1, dtype=np.float32)
     return torch.as_tensor(result, device=device)
 
-
-def replay(values, market, opinions, margins, evidence):
+def replay(values, market, opinions, margins, evidence, *, prior_values):
     previous, action = position_path(values[:-1].argmax(axis=-1)[..., None])
     previous, action = previous[:, 0], action[:, 0]
     reward, fee, _ = settle(market.close[:-1], market.close[1:], previous, action)
     row = np.arange(len(action))
-    return {"timestamp": market.time[:-1], "action": action, "previous_action": previous,
+    return {"timestamp": market.time[:-1] - np.timedelta64(1, "m"),
+            "execution_timestamp": market.time[:-1], "outcome_windows": np.asarray(OUTCOME_WINDOWS),
+            "action": action, "previous_action": previous, "market_q": prior_values[row, previous],
             "action_q": values[row, previous], "votes": opinions[row, previous],
             "margins": margins[row, previous], "evidence": evidence[row, previous],
             "reward": reward, "fee": fee, "half_lives": np.asarray(HALF_LIVES)}
@@ -88,6 +99,12 @@ def metrics(trace):
     return {"minutes": len(votes), "net_pnl_usdt": float(equity[-1]),
             "max_drawdown_usdt": float(np.max(np.maximum.accumulate(equity) - equity)),
             "fees_usdt": float(trace["fee"].sum()),
+            "expert_changes_vs_prior_same_position": int(np.count_nonzero(
+                trace["market_q"].argmax(axis=-1) != trace["action"])),
+            "pairwise_expert_disagreement": {
+                f"{HALF_LIVES[i]}_vs_{HALF_LIVES[j]}": float((votes[:, i] != votes[:, j]).mean())
+                for i in range(len(HALF_LIVES)) for j in range(i + 1, len(HALF_LIVES))
+            },
             "switches": int(np.count_nonzero(trace["action"] != trace["previous_action"])),
             "disagreement_minutes": int(np.count_nonzero((votes != votes[:, :1]).any(axis=1)))}
 
@@ -101,7 +118,7 @@ def main():
     parser.add_argument("--expert-epochs", type=int, default=12)
     parser.add_argument("--policy-epochs", type=int, default=12)
     parser.add_argument("--seed", type=int, default=12345)
-    parser.add_argument("--test", action="store_true", help="Evaluate both frozen policies on the test split")
+    parser.add_argument("--test", action="store_true", help="Evaluate the frozen market prior and both expert policies on the test split")
     args = parser.parse_args()
     if min(args.expert_epochs, args.policy_epochs) < 1 or (args.limit is not None and args.limit < 300):
         parser.error("Use positive epoch counts and at least 300 raw rows per split")
@@ -123,7 +140,7 @@ def main():
         expert = HorizonExpert(len(columns)).to(device)
         for epoch, loss in fit_action_values(expert, expert_train.values, expert_train.close,
                                              epochs=args.expert_epochs, seed=args.seed, device=device,
-                                             discount=2 ** (-1 / half_life)):
+                                             discount=2 ** (-1 / half_life), reward_bps=net_reward_bps):
             print({"expert_half_life": half_life, "epoch": epoch, **loss,
                    "elapsed_seconds": round(perf_counter() - started, 1)}, flush=True)
         experts.append(expert.eval().requires_grad_(False))
@@ -156,35 +173,51 @@ def main():
     training_data = prepare(policy_train)
     validation_data = prepare(validation)
     results = {}
-    for label, include_outcomes in (("full", True), ("ledger_only", False)):
-        torch.manual_seed(args.seed)
-        policy = PositionPolicy(len(columns)).to(device)
-        training_values = evaluator(policy_train, training_data, include_outcomes)
-        validation_values = evaluator(validation, validation_data, include_outcomes)
+
+    def fit_policy(label, policy, training_values, validation_values, prior_values=None):
         best = -np.inf
+        checkpoint = args.output / f"{label}.pt"
         for epoch, loss in fit_action_values(policy, training_values, policy_train.close,
-                                             epochs=args.policy_epochs, seed=args.seed, device=device):
+                                             epochs=args.policy_epochs, seed=args.seed, device=device,
+                                             reward_bps=net_reward_bps):
             values = scores_for(lambda rows: validation_values(policy, rows), len(validation.close), device)
-            trace = replay(values, validation, *validation_data)
+            trace = replay(values, validation, *validation_data,
+                           prior_values=values if prior_values is None else prior_values)
             summary = metrics(trace)
             print({"policy": label, "epoch": epoch, **loss, **summary,
                    "elapsed_seconds": round(perf_counter() - started, 1)}, flush=True)
             if summary["net_pnl_usdt"] > best:
                 best = summary["net_pnl_usdt"]
                 results[label] = {"validation": summary, "selected_epoch": epoch}
-                torch.save(policy.state_dict(), args.output / f"{label}.pt")
+                torch.save(policy.state_dict(), checkpoint)
                 np.savez_compressed(args.output / f"{label}_val.npz", **trace)
+        policy.load_state_dict(torch.load(checkpoint, weights_only=True, map_location=device))
+        return policy.eval()
+
+    torch.manual_seed(args.seed)
+    prior = fit_policy("market_only", HorizonExpert(len(columns)).to(device),
+                       policy_train.values, validation.values).requires_grad_(False)
+    validation_prior = scores_for(lambda rows: validation.values(prior, rows), len(validation.close), device)
+    policies = {}
+    for label, include_outcomes in (("full", True), ("ledger_only", False)):
+        torch.manual_seed(args.seed)
+        policies[label] = fit_policy(label, PositionPolicy(prior).to(device),
+                                     evaluator(policy_train, training_data, include_outcomes),
+                                     evaluator(validation, validation_data, include_outcomes),
+                                     validation_prior)
 
     if args.test:
         test = load_split("test")
         test_data = prepare(test)
-        traces = {}
-        for label in results:
-            policy = PositionPolicy(len(columns)).to(device).eval()
-            policy.load_state_dict(torch.load(args.output / f"{label}.pt", weights_only=True, map_location=device))
+        test_prior = scores_for(lambda rows: test.values(prior, rows), len(test.close), device)
+        values_by_label = {"market_only": test_prior}
+        for label, policy in policies.items():
             test_values = evaluator(test, test_data, label == "full")
-            values = scores_for(lambda rows: test_values(policy, rows), len(test.close), device)
-            trace = replay(values, test, *test_data)
+            values_by_label[label] = scores_for(lambda rows: test_values(policy, rows), len(test.close), device)
+
+        traces = {}
+        for label, values in values_by_label.items():
+            trace = replay(values, test, *test_data, prior_values=test_prior)
             traces[label] = trace
             results[label]["test"] = metrics(trace)
             np.savez_compressed(args.output / f"{label}_test.npz", **trace)
@@ -197,6 +230,8 @@ def main():
                 (same_position & disagree & (full["action"] != control["action"])).sum()),
         }
     results["execution"] = {"seed": args.seed, "device": str(device), "limit": args.limit,
+                            "execution_lag_bars": 1, "learning_reward": "basis_points",
+                            "outcome_windows": OUTCOME_WINDOWS,
                             "elapsed_seconds": round(perf_counter() - started, 1)}
     (args.output / "metrics.json").write_text(json.dumps(results, indent=2), encoding="utf-8")
     print(results, flush=True)

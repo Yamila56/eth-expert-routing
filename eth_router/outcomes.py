@@ -4,11 +4,13 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from .market_env import POSITION_ETH, settle
+from .market_env import FEE_RATE
 
 
 HALF_LIVES = (5, 30, 120)
-OUTCOME_MINUTES = 30
+OUTCOME_WINDOWS = (5, 30, 120)
+ACCOUNT_FIELDS = 2
+OUTCOME_FIELDS = 3
 HISTORY_MINUTES = 360
 RAW_COLUMNS = ("timestamp", "close", "volume", "ask1_price", "bid1_price", "volume_imbalance")
 
@@ -32,11 +34,12 @@ def load_market(directory: Path, split: str, limit: int | None = None):
         columns[f"spread_{window}"] = spread.rolling(window).mean()
         columns[f"imbalance_{window}"] = frame.volume_imbalance.rolling(window).mean()
     warmup = max(HALF_LIVES)
-    if len(frame) <= warmup + OUTCOME_MINUTES:
-        raise ValueError(f"{split}: insufficient rows for feature warm-up and outcome evaluation")
-    features = pd.DataFrame(columns).iloc[warmup:].to_numpy(dtype=np.float32)
-    return (timestamps.iloc[warmup:].to_numpy(dtype="datetime64[ns]"),
-            frame.close.iloc[warmup:].to_numpy(dtype=np.float64), features, list(columns))
+    if len(frame) <= warmup + 2:
+        raise ValueError(f"{split}: insufficient rows for feature warm-up and delayed execution")
+    # Index every row by its simulated execution bar. Its observations stop one bar before.
+    features = pd.DataFrame(columns).iloc[warmup:-1].to_numpy(dtype=np.float32)
+    return (timestamps.iloc[warmup + 1:].to_numpy(dtype="datetime64[ns]"),
+            frame.close.iloc[warmup + 1:].to_numpy(dtype=np.float64), features, list(columns))
 
 
 def position_path(actions):
@@ -59,34 +62,38 @@ def rolling_sum(values, width):
     return trailing
 
 
-def decision_evidence(close, opinions, *, horizon=OUTCOME_MINUTES, history=HISTORY_MINUTES):
-    """Return [minute, starting position, expert, field] with settled observations only."""
+def net_reward_bps(entry, mark, previous, action):
+    return 10_000 * (action * (mark - entry) / entry - FEE_RATE * np.abs(action - previous))
+
+
+def decision_evidence(close, opinions, *, horizons=OUTCOME_WINDOWS, history=HISTORY_MINUTES):
+    """Return evidence for decisions made one bar before the indexed execution close."""
     n, _, count = opinions.shape
     previous, actions = position_path(opinions)
-    pnl, _, _ = settle(close[:-1, None], close[1:, None], previous[:-1], actions[:-1])
-    zero = np.zeros((1, count))
-    settled = rolling_sum(np.concatenate((zero, pnl)), history)
-    turnover = rolling_sum(np.concatenate((zero, previous[:-1] != actions[:-1])), history)
-    account = np.empty((n, count, 2), dtype=np.float32)
-    account[..., 0] = settled / (POSITION_ETH * close[:, None]) * 10_000
-    account[..., 1] = turnover / history
+    # The interval [j, j+1] has settled when deciding for execution bar j+2.
+    ledger = np.zeros((n, count, ACCOUNT_FIELDS))
+    ledger[2:, :, 0] = net_reward_bps(close[:-2, None], close[1:-1, None],
+                                     previous[:-2], actions[:-2])
+    ledger[2:, :, 1] = previous[:-2] != actions[:-2]
+    account = rolling_sum(ledger, history)
+    evidence = np.zeros((n, 2, count, ACCOUNT_FIELDS + OUTCOME_FIELDS * len(horizons)), dtype=np.float32)
+    evidence[..., :ACCOUNT_FIELDS] = account[:, None]
+    evidence[..., 1] /= history
 
-    # Compare holding the chosen position and holding the other position for H minutes.
-    positions = np.arange(2)
-    rewards, _, _ = settle(close[:-horizon, None, None], close[horizon:, None, None],
-                           positions[None, :, None], opinions[:-horizon])
-    alternate, _, _ = settle(close[:-horizon, None, None], close[horizon:, None, None],
-                             positions[None, :, None], 1 - opinions[:-horizon])
-    difference = (rewards - alternate) / (POSITION_ETH * close[:-horizon, None, None]) * 10_000
-    delayed = np.zeros((n, 2, count, 2), dtype=np.float32)
-    delayed[horizon:, ..., 0] = difference
-    delayed[horizon:, ..., 1] = (np.sign(difference) + 1) / 2  # Half-credit for ties.
-    total = rolling_sum(delayed, history)
-    samples = np.clip(np.arange(n) - horizon + 1, 0, history)
-    averages = total / np.maximum(samples, 1)[:, None, None, None]
+    positions = np.arange(2)[None, :, None]
+    for index, horizon in enumerate(horizons):
+        delay = horizon + 1
+        entry = close[:-delay, None, None]
+        mark = close[horizon:-1, None, None]
+        chosen = opinions[:-delay]
+        advantage = net_reward_bps(entry, mark, positions, chosen)
+        advantage -= net_reward_bps(entry, mark, positions, 1 - chosen)
 
-    evidence = np.empty((n, 2, count, 5), dtype=np.float32)
-    evidence[..., :2] = account[:, None]
-    evidence[..., 2:4] = averages
-    evidence[..., 4] = samples[:, None, None]
+        delayed = np.zeros((n, 2, count, 2), dtype=np.float32)
+        delayed[delay:, ..., 0] = advantage
+        delayed[delay:, ..., 1] = (np.sign(advantage) + 1) / 2
+        samples = np.clip(np.arange(n) - delay + 1, 0, history)
+        start = ACCOUNT_FIELDS + OUTCOME_FIELDS * index
+        evidence[..., start:start + 2] = rolling_sum(delayed, history) / np.maximum(samples, 1)[:, None, None, None]
+        evidence[..., start + 2] = samples[:, None, None]
     return evidence

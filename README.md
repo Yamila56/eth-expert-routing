@@ -11,11 +11,13 @@ flowchart LR
     M[Minute market features] --> X[Three horizon experts]
     X --> A[Independent expert accounts]
     X --> E[Delayed action comparisons]
-    X --> P[Position policy]
+    X --> P[Expert correction]
     A --> P
     E --> P
     S[Current position] --> P
-    M --> P
+    S --> B
+    M --> B[Frozen market baseline]
+    B --> V
     P --> V[Flat and long action values]
     V --> T[Target position]
 ```
@@ -26,11 +28,15 @@ The three specialists start with the same architecture and initialization. They 
 
 ### Expert evidence
 
-Each expert trades in an independent simulated account. Its recent net PnL and turnover describe how following that expert would have played out. A second record evaluates its individual recommendations from each possible starting position. For each recommendation, the simulator marks both candidate positions 30 minutes later and charges the corresponding initial trade fee. The rolling record tracks the recommended action's net advantage, win rate with half credit for ties, and sample count. A result becomes available when its window closes.
+Each expert trades in an independent simulated account. Its recent net PnL and turnover describe how following that expert would have played out. A second record evaluates its individual recommendations from each possible starting position. The simulator marks both candidate positions at 5, 30 and 120 minutes after the simulated fill and charges the corresponding initial fee. Each expert is evaluated at all three windows so the policy can compare them on equal terms. The rolling record tracks net advantage, win rate with half credit for ties, and settled sample count.
 
 ### Position policy
 
-The controller reads the expert's recommendation from its actual starting position alongside the expert's normalized action-value gap and settled records. A shared encoder processes the three inputs, and their mean feeds a Q network together with the market features and current position. The network estimates the two action values and selects the higher one. Training fits both action values and their difference using Double Q targets for all four position transitions on the same price move. The simulator assumes a fixed market path and charges 0.02% of traded value at the current close.
+The controller adds an expert-based correction to a frozen market-only Q network. A shared encoder reads each expert's log half-life, current recommendation, normalized action-value gap and settled records. The correction uses the mean of these encodings and the current position. The replay records how often it changes the market baseline's action at the same position.
+
+A decision uses the completed observations available through bar `t`, then fills at the close of bar `t+1`. Returns and fees enter the learning objective in basis points relative to traded notional. The simulator charges 2 bp per switch and reports account PnL in USDT. Paired Double Q training fits the two action values and their difference using the four possible position transitions.
+
+[Method and timing details](docs/method.md)
 
 ## Quick Start
 
@@ -47,6 +53,6 @@ python -m eth_router.horizons --source data/raw --output runs/quickstart --limit
 python -m eth_router.viewer --trace runs/quickstart/full_val.npz --output runs/quickstart/replay.html
 ```
 
-Open the HTML replay to inspect expert recommendations, settled evidence, action values and simulated fees. For full training, omit the row limit and the epoch overrides. Add `--device cuda:0` with a CUDA build of PyTorch. The run saves the trained experts, checkpoints and validation traces for both the full policy and the ledger-only control. Adding `--test` evaluates the two validation-selected checkpoints on the test split.
+Open the HTML replay to inspect expert recommendations, settled evidence, action values and simulated fees. For full training, omit the row limit and the epoch overrides. Add `--device cuda:0` with a CUDA build of PyTorch. The run saves the trained experts, checkpoints and validation traces for the market-only baseline, full expert policy and ledger-only control. Adding `--test` evaluates their validation-selected checkpoints on the test split.
 
-The previous six-expert workflow and its checkpoint sources are documented in the [legacy architecture notes](docs/architecture.md).
+The previous six-expert workflow and its checkpoint sources are documented in the [legacy architecture notes](docs/legacy/six-expert-architecture.md).

@@ -39,6 +39,7 @@ button,input{font:inherit}button{padding:4px 10px}#error{color:#ffae9c}
 </section>
 <section><h2>仓位决策</h2><div class="metrics" id="decision"></div><p id="explanation"></p></section>
 <section><h2>专家证据</h2>
+<label id="window-label" hidden>评价窗口 <select id="outcome-window"></select></label>
 <table><thead><tr id="expert-header"><th>专家</th><th>建议</th><th>适用度</th><th>近期净损益 · bp</th><th>换仓频率</th><th>权重</th></tr></thead>
 <tbody id="experts"></tbody></table></section>
 </main>
@@ -53,6 +54,17 @@ async function start(){
   const d = await new Response(stream).json(), n=d.action.length;
   const horizonReplay=Boolean(d.half_lives);
   const names=horizonReplay ? d.half_lives.map(h=>h+" 分钟") : legacyNames;
+  const windows=d.outcome_windows;
+  const evidenceWidth=windows ? 2+3*windows.length : 5;
+  const picker=el("outcome-window");
+  if(windows){
+    el("window-label").hidden=false;
+    for(const [index,minutes] of windows.entries()){
+      const option=document.createElement("option");
+      option.value=index;option.textContent=minutes+" 分钟";picker.append(option);
+    }
+    picker.value=windows.indexOf(30)>=0 ? windows.indexOf(30) : 0;
+  }
   if(horizonReplay){
     el("disagree").hidden=false;
     el("expert-header").replaceChildren(...["折扣半衰期","建议","标准化价值差","近期净损益 · bp",
@@ -82,7 +94,15 @@ async function start(){
     const previous=d.previous_action[i], actual=d.action[i], q=horizonReplay ? d.action_q[i] : d.mixed_q[i];
     const proposed=Number(q[1]>q[0]), edge=q[1-previous]-q[previous];
     const fields=[["上一仓位",holding(previous)],["最终仓位",holding(actual)],["换仓优势",num(edge,5)]];
-    if(horizonReplay) fields.push(["空仓价值",num(q[0],5)],["持仓价值",num(q[1],5)]);
+    if(horizonReplay) {
+      const unit=windows ? " · bp" : "";
+      fields.push(["空仓价值"+unit,num(q[0],5)],["持仓价值"+unit,num(q[1],5)]);
+      if(windows){
+        const prior=d.market_q[i], priorEdge=prior[1-previous]-prior[previous];
+        fields.push(["市场基线换仓优势 · bp",num(priorEdge,5)],["专家修正 · bp",num(edge-priorEdge,5)],
+                    ["模拟成交",d.execution_time[i]]);
+      }
+    }
     else fields.push(["加权建议",holding(proposed)],["换仓门槛",num(d.threshold[i],5)]);
     fields.push(["手续费",num(d.fee[i],4)],["累计净损益",num(equity[i],4)]);
     el("decision").replaceChildren(...fields.map(([label,value])=>{
@@ -90,11 +110,13 @@ async function start(){
     }));
     el("explanation").textContent=horizonReplay ? "" : proposed!==actual ? "换仓门槛使账户维持原仓位。" :
       actual!==previous ? "加权建议通过换仓门槛，账户改变仓位。" : "加权建议维持当前仓位。";
+    const outcome=windows ? 2+3*Number(picker.value) : 2;
     el("experts").replaceChildren(...names.map((name,j)=>{
-      const e=d.evidence[i].slice(j*5,j*5+5), v=d.votes[i][j];
+      const e=d.evidence[i].slice(j*evidenceWidth,(j+1)*evidenceWidth), v=d.votes[i][j];
       const cells=horizonReplay ?
         [name,holding(v),num(d.margins[i][j],2),num(e[0],2),num(e[1]*100,2)+"%",
-         e[4] ? num(e[2],2) : "待结算",e[4] ? num(e[3]*100,1)+"%" : "待结算",e[4]] :
+         e[outcome+2] ? num(e[outcome],2) : "待结算",
+         e[outcome+2] ? num(e[outcome+1]*100,1)+"%" : "待结算",e[outcome+2]] :
         [name,v===0?"持平":v>0?"持有":"空仓",e[4] ? num(e[3]*100,1)+"%" : "历史不足",
                    num(e[0],2),num(e[1]*100,2)+"%",num(d.weights[i][j]*100,2)+"%"];
       const tr=document.createElement("tr");
@@ -103,6 +125,7 @@ async function start(){
     }));
     draw();
   }
+  picker.onchange=()=>select(i);
   el("cursor").oninput=e=>select(+e.target.value);
   el("minute").onchange=e=>select(+e.target.value-1);
   el("prev").onclick=()=>select(i-1);el("next").onclick=()=>select(i+1);
@@ -132,6 +155,10 @@ def export(trace_path, output):
         else:
             keys += ("mixed_q", "threshold", "weights")
         data = {key: trace[key].tolist() for key in keys}
+        if "outcome_windows" in trace:
+            data["outcome_windows"] = trace["outcome_windows"].tolist()
+            data["market_q"] = trace["market_q"].tolist()
+            data["execution_time"] = np.datetime_as_string(trace["execution_timestamp"], unit="m").tolist()
         data["evidence"] = evidence.tolist()
         data["time"] = np.datetime_as_string(trace["timestamp"], unit="m").tolist()
     payload = base64.b64encode(gzip.compress(json.dumps(data, separators=(",", ":"), allow_nan=False).encode()))

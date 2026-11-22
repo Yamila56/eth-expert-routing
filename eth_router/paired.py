@@ -22,14 +22,15 @@ def fit_paired(router, features, scores, close, *, epochs, seed, device):
 
 
 def fit_action_values(router, values, close, *, epochs, seed, device, discount=0.99,
-                      batch_size=512):
+                      batch_size=512, reward_bps=None):
     rng = np.random.default_rng(seed)
     optimizer = torch.optim.Adam(router.parameters(), lr=1e-4)
     target = deepcopy(router).requires_grad_(False)
     minutes = len(close) - 1
     positions = np.arange(2)
-    rewards, _, _ = settle(close[:-1, None, None], close[1:, None, None],
-                           positions[None, :, None], positions[None, None, :])
+    transition = (close[:-1, None, None], close[1:, None, None],
+                  positions[None, :, None], positions[None, None, :])
+    rewards = settle(*transition)[0] if reward_bps is None else reward_bps(*transition)
     rewards = torch.as_tensor(rewards, dtype=torch.float32, device=device)
 
     for epoch in range(epochs):
