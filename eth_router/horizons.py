@@ -109,6 +109,27 @@ def metrics(trace):
             "disagreement_minutes": int(np.count_nonzero((votes != votes[:, :1]).any(axis=1)))}
 
 
+def validation_td_error(values, close, discount=0.99):
+    position = np.arange(2)
+    rewards = net_reward_bps(close[:-1, None, None], close[1:, None, None],
+                             position[None, :, None], position[None, None, :])
+    continuation = values[1:].max(axis=-1).copy()
+    continuation[-1] = 0
+    absolute_error = np.abs(values[:-1] - (rewards + discount * continuation[:, None, :]))
+    return float(np.where(absolute_error < 1, 0.5 * absolute_error**2, absolute_error - 0.5).mean())
+
+
+def expert_disagreement(opinions):
+    labels = ("flat", "long")
+    return {
+        label: {
+            f"{HALF_LIVES[i]}_vs_{HALF_LIVES[j]}": float((opinions[:-1, p, i] != opinions[:-1, p, j]).mean())
+            for i in range(len(HALF_LIVES)) for j in range(i + 1, len(HALF_LIVES))
+        }
+        for p, label in enumerate(labels)
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path, required=True)
@@ -119,6 +140,8 @@ def main():
     parser.add_argument("--policy-epochs", type=int, default=12)
     parser.add_argument("--seed", type=int, default=12345)
     parser.add_argument("--test", action="store_true", help="Evaluate the frozen market prior and both expert policies on the test split")
+    parser.add_argument("--training-ablation", action="store_true",
+                        help="Compare sampled and paired TD updates on the full expert policy")
     args = parser.parse_args()
     if min(args.expert_epochs, args.policy_epochs) < 1 or (args.limit is not None and args.limit < 300):
         parser.error("Use positive epoch counts and at least 300 raw rows per split")
@@ -173,17 +196,22 @@ def main():
     training_data = prepare(policy_train)
     validation_data = prepare(validation)
     results = {}
+    curves = {}
 
-    def fit_policy(label, policy, training_values, validation_values, prior_values=None):
+    def fit_policy(label, policy, training_values, validation_values, prior_values=None, **training_options):
         best = -np.inf
         checkpoint = args.output / f"{label}.pt"
+        curve = []
         for epoch, loss in fit_action_values(policy, training_values, policy_train.close,
                                              epochs=args.policy_epochs, seed=args.seed, device=device,
-                                             reward_bps=net_reward_bps):
+                                             reward_bps=net_reward_bps, **training_options):
             values = scores_for(lambda rows: validation_values(policy, rows), len(validation.close), device)
             trace = replay(values, validation, *validation_data,
                            prior_values=values if prior_values is None else prior_values)
             summary = metrics(trace)
+            if args.training_ablation:
+                curve.append({"epoch": epoch, **loss, "net_pnl_usdt": summary["net_pnl_usdt"],
+                              "validation_bellman_huber": validation_td_error(values, validation.close)})
             print({"policy": label, "epoch": epoch, **loss, **summary,
                    "elapsed_seconds": round(perf_counter() - started, 1)}, flush=True)
             if summary["net_pnl_usdt"] > best:
@@ -191,6 +219,8 @@ def main():
                 results[label] = {"validation": summary, "selected_epoch": epoch}
                 torch.save(policy.state_dict(), checkpoint)
                 np.savez_compressed(args.output / f"{label}_val.npz", **trace)
+        if curve:
+            curves[label] = curve
         policy.load_state_dict(torch.load(checkpoint, weights_only=True, map_location=device))
         return policy.eval()
 
@@ -206,13 +236,26 @@ def main():
                                      evaluator(validation, validation_data, include_outcomes),
                                      validation_prior)
 
+    if args.training_ablation:
+        full_training = evaluator(policy_train, training_data, True)
+        full_validation = evaluator(validation, validation_data, True)
+        for label, sampled in (("paired_td", False), ("sampled_td", True)):
+            torch.manual_seed(args.seed)
+            policies[label] = fit_policy(label, PositionPolicy(prior).to(device),
+                                         full_training, full_validation, validation_prior,
+                                         sampled=sampled, margin_weight=0.0)
+        results["learning_curves"] = curves
+        results["expert_disagreement"] = {"validation": expert_disagreement(validation_data[0])}
+
     if args.test:
         test = load_split("test")
         test_data = prepare(test)
+        if args.training_ablation:
+            results["expert_disagreement"]["test"] = expert_disagreement(test_data[0])
         test_prior = scores_for(lambda rows: test.values(prior, rows), len(test.close), device)
         values_by_label = {"market_only": test_prior}
         for label, policy in policies.items():
-            test_values = evaluator(test, test_data, label == "full")
+            test_values = evaluator(test, test_data, label != "ledger_only")
             values_by_label[label] = scores_for(lambda rows: test_values(policy, rows), len(test.close), device)
 
         traces = {}

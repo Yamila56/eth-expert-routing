@@ -22,8 +22,11 @@ def fit_paired(router, features, scores, close, *, epochs, seed, device):
 
 
 def fit_action_values(router, values, close, *, epochs, seed, device, discount=0.99,
-                      batch_size=512, reward_bps=None):
+                      batch_size=512, reward_bps=None, sampled=False, margin_weight=1.0):
+    if sampled and margin_weight:
+        raise ValueError("A sampled transition has no paired action margin")
     rng = np.random.default_rng(seed)
+    action_rng = np.random.default_rng(seed + 1)
     optimizer = torch.optim.Adam(router.parameters(), lr=1e-4)
     target = deepcopy(router).requires_grad_(False)
     minutes = len(close) - 1
@@ -48,10 +51,18 @@ def fit_action_values(router, values, close, *, epochs, seed, device, discount=0
                 immediate = rewards[rows]
                 # Today's target position becomes tomorrow's starting position.
                 expected = immediate + discount * continuation[:, None, :]
-            td = F.smooth_l1_loss(current, expected)
-            margin = F.smooth_l1_loss(current.diff(dim=-1), expected.diff(dim=-1))
+            if sampled:
+                # Use a separate stream so both arms see the same minibatch of minutes.
+                combination = torch.as_tensor(action_rng.integers(4, size=(len(rows), 1)), device=device)
+                selected = current.flatten(1).gather(1, combination)
+                selected_target = expected.flatten(1).gather(1, combination)
+                td = F.smooth_l1_loss(selected, selected_target)
+            else:
+                td = F.smooth_l1_loss(current, expected)
+            margin = (F.smooth_l1_loss(current.diff(dim=-1), expected.diff(dim=-1))
+                      if margin_weight else td.new_zeros(()))
             optimizer.zero_grad()
-            (td + margin).backward()
+            (td + margin_weight * margin).backward()
             torch.nn.utils.clip_grad_norm_(router.parameters(), 1.0)
             optimizer.step()
             with torch.no_grad():
@@ -61,4 +72,4 @@ def fit_action_values(router, values, close, *, epochs, seed, device, discount=0
             updates += 1
         td_mean, margin_mean = (errors / minutes).tolist()
         yield epoch + 1, {"updates": updates, "td_loss": td_mean,
-                          "margin_loss": margin_mean}
+                          "margin_loss": margin_mean, "transitions": minutes * (1 if sampled else 4)}

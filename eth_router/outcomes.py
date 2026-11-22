@@ -15,7 +15,7 @@ HISTORY_MINUTES = 360
 RAW_COLUMNS = ("timestamp", "close", "volume", "ask1_price", "bid1_price", "volume_imbalance")
 
 
-def load_market(directory: Path, split: str, limit: int | None = None):
+def load_market(directory: Path, split: str, limit: int | None = None, *, windows=HALF_LIVES):
     frame = pd.read_feather(directory / f"df_{split}.feather", columns=list(RAW_COLUMNS)).iloc[:limit]
     timestamps = pd.to_datetime(frame["timestamp"])
     if not timestamps.diff().iloc[1:].eq(pd.Timedelta(minutes=1)).all():
@@ -27,13 +27,13 @@ def load_market(directory: Path, split: str, limit: int | None = None):
     volume = np.log1p(frame.volume.clip(lower=0))
     spread = (frame.ask1_price - frame.bid1_price) / frame.close
     columns = {}
-    for window in HALF_LIVES:
+    for window in windows:
         columns[f"return_{window}"] = log_price.diff(window)
         columns[f"volatility_{window}"] = returns.rolling(window).std()
         columns[f"volume_{window}"] = volume - volume.rolling(window).mean()
         columns[f"spread_{window}"] = spread.rolling(window).mean()
         columns[f"imbalance_{window}"] = frame.volume_imbalance.rolling(window).mean()
-    warmup = max(HALF_LIVES)
+    warmup = max(windows)
     if len(frame) <= warmup + 2:
         raise ValueError(f"{split}: insufficient rows for feature warm-up and delayed execution")
     # Index every row by its simulated execution bar. Its observations stop one bar before.

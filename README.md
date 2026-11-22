@@ -55,4 +55,11 @@ python -m eth_router.viewer --trace runs/quickstart/full_val.npz --output runs/q
 
 Open the HTML replay to inspect expert recommendations, settled evidence, action values and simulated fees. For full training, omit the row limit and the epoch overrides. Add `--device cuda:0` with a CUDA build of PyTorch. The run saves the trained experts, checkpoints and validation traces for the market-only baseline, full expert policy and ledger-only control. Adding `--test` evaluates their validation-selected checkpoints on the test split.
 
+## Experiments
+
+- [Forecast-driven position rule and its historical replay](docs/rule-replay.md)
+- [Shared-signal policy comparison](docs/signal-study.md)
+- [Fixed-entry exit study](docs/exit-study.md)
+- [Contextual holding-period study](docs/duration-study.md)
+
 The previous six-expert workflow and its checkpoint sources are documented in the [legacy architecture notes](docs/legacy/six-expert-architecture.md).
