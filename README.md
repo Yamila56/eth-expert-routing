@@ -1,85 +1,52 @@
 # ETH Expert Routing
 
-ETH Expert Routing is a PyTorch agent that manages a simulated ETH/USDT position one minute at a time. Six frozen trend and volatility specialists each score two positions: flat and long 0.2 ETH. The agent learns how much weight to give each specialist and how large an advantage it needs to switch positions. Every decision can be inspected in a browser replay.
+**Learning from Counterfactual Trade Outcomes**
 
-## Features
-
-- **Independent expert accounts** — Follow the trades each specialist would have made on its own. Its six-hour performance record includes fees and tracks how often it changed position, even when the agent followed another specialist.
-- **Walk-forward market fit** — Compare the current hour with historical conditions in which each specialist outperformed the group median. Fit scores for training are generated from previously settled windows. Validation uses models fitted on the training split.
-- **Position-aware routing** — Ask every specialist to score both actions from the agent's actual position. A shared network can give different weights to two experts recommending the same trade based on the strength of their preferences, their track records and their fit to current conditions.
-- **Minute-level decision replay** — Select a timestamp to inspect the votes and weights, compare action values before and after the switching threshold, and see the position and fee recorded by the simulator.
+ETH Expert Routing is a PyTorch agent that manages a simulated ETH/USDT position one minute at a time. Three specialists assess whether to stay flat or hold 0.2 ETH. A position policy combines their current recommendations with records of how their earlier recommendations settled.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-    M[Minute observations] --> X[Six frozen experts]
-    X --> L[Six independent accounts]
-    M --> F[Market fit]
-    L --> R[Shared expert scorer]
-    F --> R
-    X --> R
-    R --> Q[Weighted action values]
-    Q --> G[Switching threshold]
-    P[Previous agent position] --> G
-    G --> A[Target position]
-    A --> S[Settlement at the next close]
+    M[Minute market features] --> X[Three horizon experts]
+    X --> A[Independent expert accounts]
+    X --> E[Delayed action comparisons]
+    X --> P[Position policy]
+    A --> P
+    E --> P
+    S[Current position] --> P
+    M --> P
+    P --> V[Flat and long action values]
+    V --> T[Target position]
 ```
 
-### Expert routing
+### Expert training
 
-The router uses two views of each specialist. Its track record follows its own sequence of positions. Its current recommendation answers a different question: given the position the agent actually holds, how does this expert value staying flat or holding ETH? Keeping these paths separate means the router can evaluate a specialist that has held ETH for an hour even if the agent is still flat.
+The three specialists start with the same architecture and initialization. They use causal return, volatility, volume, spread and order-imbalance features. Their reward discounts have half-lives of 5, 30 and 120 minutes, so they learn action values over different time scales while making decisions every minute. The training split is divided chronologically. Experts train on the first 60% and stay frozen while the position policy learns on the remaining 40%.
 
-The shared scorer reads each expert's identity, preferred direction and action-value margin alongside settled performance and market fit. Fit is calibrated using one-hour return, volatility, spread, volume and volume imbalance. The default estimator measures standardized distance from the center of favorable windows. An optional estimator uses variational autoencoder reconstruction error. A softmax turns the six expert scores into weights, and the same weights aggregate the flat and long action values.
+### Expert evidence
 
-### Position control
+Each expert trades in an independent simulated account. Its recent net PnL and turnover describe how following that expert would have played out. A second record evaluates its individual recommendations from each possible starting position. For each recommendation, the simulator marks both candidate positions 30 minutes later and charges the corresponding initial trade fee. The rolling record tracks the recommended action's net advantage, win rate with half credit for ties, and sample count. A result becomes available when its window closes.
 
-A second network sets a switching threshold from the market state, previous position, expert disagreement and weighted market fit. For example, when the agent is flat, the threshold is subtracted from the aggregated long value before the policy selects the higher-valued action. The threshold is expressed in action-value units. The simulator separately charges 0.02% of traded value when a position changes at the current close and marks the position at the next close.
+### Position policy
 
-### Policy training
-
-For each training minute, the simulator can settle both possible actions against the same next close. From a flat account these actions mean staying flat or buying. From a long account they mean selling or holding. The default trainer evaluates all four cases, charging each switch its own fee. This pairing relies on the simulator's fixed price path and assumes the agent's orders have no market impact.
-
-A Double DQN target adds the continuation value from the position each action would leave behind. Two Huber losses train the shared scorer and threshold together. One fits the action values, and the other fits the difference between them, giving the decision margin a direct training signal. The next price enters the target only after the simulated step. During replay the agent sees the current observations and its actual position.
+The controller reads the expert's recommendation from its actual starting position alongside the expert's normalized action-value gap and settled records. A shared encoder processes the three inputs, and their mean feeds a Q network together with the market features and current position. The network estimates the two action values and selects the higher one. Training fits both action values and their difference using Double Q targets for all four position transitions on the same price move. The simulator assumes a fixed market path and charges 0.02% of traded value at the current close.
 
 ## Quick Start
 
-Run the following commands from the repository root with Python 3.11 or newer and Git. This example uses shortened data splits and runs on a CPU.
-
-### Install dependencies
-
-```bash
-python -m venv .venv
-```
-
-Activate the environment with `source .venv/bin/activate` on macOS or Linux, or `.\.venv\Scripts\Activate.ps1` in Windows PowerShell.
+Use Python 3.11 or newer. Create a virtual environment with `python -m venv .venv` and activate it with `source .venv/bin/activate` on macOS or Linux, or `.\.venv\Scripts\Activate.ps1` in PowerShell.
 
 ```bash
 python -m pip install -r requirements.txt
 ```
 
-### Prepare data and expert weights
-
-Download `df_train.feather` and `df_val.feather` into `data/raw/` from the dataset released with MacroHFT. [ETH/USDT dataset](https://drive.google.com/drive/folders/1AYHy-wUV0IwPoA7E1zvMRPL3wK0tPNiY)
-
-The pinned checkout below supplies the feature lists and six pretrained weights. The `--upstream` option reads those files. Agent training and inference run through this repository's implementation.
+Download `df_train.feather` and `df_val.feather` into `data/raw/`. Include `df_test.feather` for held-out replay. The minute data were released by the MacroHFT authors. [ETH/USDT dataset](https://drive.google.com/drive/folders/1AYHy-wUV0IwPoA7E1zvMRPL3wK0tPNiY)
 
 ```bash
-git clone https://github.com/ZONG0004/MacroHFT.git data/expert-source
-git -C data/expert-source checkout 31e5ef41f93b2aea6e63e6ae2267675c997a8e54
+python -m eth_router.horizons --source data/raw --output runs/quickstart --limit 24576 --expert-epochs 1 --policy-epochs 1
+python -m eth_router.viewer --trace runs/quickstart/full_val.npz --output runs/quickstart/replay.html
 ```
 
-### Train and replay
+Open the HTML replay to inspect expert recommendations, settled evidence, action values and simulated fees. For full training, omit the row limit and the epoch overrides. Add `--device cuda:0` with a CUDA build of PyTorch. The run saves the trained experts, checkpoints and validation traces for both the full policy and the ledger-only control. Adding `--test` evaluates the two validation-selected checkpoints on the test split.
 
-```bash
-python -m eth_router.market --source data/raw --output runs/quickstart/market --limit 8192
-python -m eth_router.evidence --upstream data/expert-source --source runs/quickstart/market --output runs/quickstart/evidence --fold-minutes 3600 --epochs 1
-python -m eth_router.train --upstream data/expert-source --data runs/quickstart/evidence --output runs/quickstart/model
-python -m eth_router.viewer --trace runs/quickstart/model/expert_trace.npz --output runs/quickstart/replay.html
-```
-
-Training saves the router checkpoint as `runs/quickstart/model/router.pt` and the validation trace alongside it. Open `runs/quickstart/replay.html` in a browser to inspect each minute's expert recommendations, routing weights, switching threshold, selected position, and transaction fee.
-
-For full-length data splits, omit `--limit 8192` from the market preparation command and `--fold-minutes 3600 --epochs 1` from the evidence command. Additional options cover CUDA expert inference, independently stored weights, and replay from an existing checkpoint. [Architecture and configuration](docs/architecture.md)
-
-Data, checkpoint and method credits are listed in the [architecture notes](docs/architecture.md#sources).
+The previous six-expert workflow and its checkpoint sources are documented in the [legacy architecture notes](docs/architecture.md).
